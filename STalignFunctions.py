@@ -501,7 +501,7 @@ def rasterizePCA(x, y, G):
 
 ### ADDED FUNCTION FOR RASTERIZE WITH CELL TYPE FOR GENE EXP ### 
 def rasterizeGeneExp(x, y, G, dx=30.0, blur=1.0, expand=1.1):
-    ''' 
+    """
     Rasterize a spatial transcriptomics dataset into 2D gene expression images per gene.
 
     Each gene's expression across spatial locs is converted into a smooth rasterized image. 
@@ -550,7 +550,8 @@ def rasterizeGeneExp(x, y, G, dx=30.0, blur=1.0, expand=1.1):
     >>> X, Y, XI, YI = rasterizeGeneExp(x, y, G, dx=30.0, blur=[2.0,1.0,0.5],
                                         wavelet_magnitude=True)
       
-    '''
+    """
+
     nrows, ncols = 0, 0 # initialize rows and cols 
 
     # iterate through all genes in matrix 
