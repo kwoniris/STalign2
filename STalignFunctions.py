@@ -556,15 +556,16 @@ def rasterizeGeneExp(x, y, G, dx=30.0, blur=1.0, expand=1.1):
 
     # iterate through all genes in matrix 
     for i in range(G.shape[1]): 
-        if(i==0):
-            nrows, ncols = YI.size, XI.size 
-            X = np.empty([G.shape[1], nrows, ncols]) 
-            Y = np.empty([G.shape[1], nrows*ncols])
 
         # loop through all the genes 
         g = np.array(G.iloc[:,i]) # get gene exp vector for that gene 
         # rasterize into smooth 2D image based on gene expression level at that spatial loc 
         XI, YI, I = rasterize(X, y, g=g, dx=dx, blur=blur, expand=expand)
+
+        if(i==0):
+            nrows, ncols = YI.size, XI.size 
+            X = np.empty([G.shape[1], nrows, ncols]) 
+            Y = np.empty([G.shape[1], nrows*ncols])
 
         # center data 
         X[i] = np.array(I)
@@ -981,505 +982,125 @@ def L_T_from_points(pointsI,pointsJ):
     return L,T
 
 ### UPDATED LDDMM() FUNCTION WITH GENE EXP ### 
-def LDDMM(xI,I,xJ,J, Ig, Jg, pointsI=None,pointsJ=None,
-          L=None,T=None,A=None,v=None,xv=None,
-          a=500.0,p=2.0,expand=2.0,nt=3,
-         niter=5000,diffeo_start=0, epL=2e-8, epT=2e-1, epV=2e3,
-         sigmaM=1.0,sigmaMg=1.0, sigmaB=2.0,sigmaA=5.0,sigmaR=5e5,sigmaP=2e1,
-          device='cpu',dtype=torch.float64, muB=None, muA=None):
-    """
-    Run LDDMM betwen a pair of source (I, Ig) and target (J, Jg) spatial transcriptomics images. 
-
-    The algorithm jointly estimates: 
-        1. An affine transformation A = [L | T], and 
-        2. A nonlinear diffeomorphic deformation φ (phi) parameterized by the velocity field ('v')
-    by minimizing a variational energy functional that aligns both cell density and 
-    gene expression distributions. 
-
-    The final mapping is of the form: 
-        x → A φ(x)
-
-    Parameters
-    ----------
-    xI : list[torch.Tensor]
-        Coordinate axes (e.g., [x, y]) for the source image `I`, in physical units (e.g., microns).
-    I : torch.Tensor
-        Source **cell density** image (e.g., rasterized cell positions), with channels along the first axis.
-    xJ : list[torch.Tensor]
-        Coordinate axes for the target image `J`.
-    J : torch.Tensor
-        Target **cell density** image.
-    Ig : torch.Tensor
-        Source **gene expression** tensor aligned with `I`. Each channel may represent a different gene.
-    Jg : torch.Tensor
-        Target **gene expression** tensor aligned with `J`.
-    pointsI : torch.Tensor, optional
-        N×2 set of landmark points (e.g., cell centroids) in the source image. Default is None.
-    pointsJ : torch.Tensor, optional
-        N×2 set of corresponding landmark points in the target image. Default is None.
-    L : torch.Tensor, optional
-        Initial 2×2 matrix for the linear component of the affine transformation. Defaults to identity.
-    T : torch.Tensor, optional
-        Initial 2-vector for the translation component. Defaults to zeros.
-    A : torch.Tensor, optional
-        Initial full affine transformation matrix [L | T]. Provide either `A` or (`L`, `T`), not both.
-    v : torch.Tensor, optional
-        Initial velocity field (nt × H × W × 2). If None, initialized to zeros.
-    xv : list[torch.Tensor], optional
-        Coordinate grid corresponding to velocity field `v`. Must be provided if `v` is given.
-    a : float, default=500.0
-        Smoothness scale for the velocity field regularization.
-    p : float, default=2.0
-        Power of the Laplacian used in regularization.
-    expand : float, default=2.0
-        Expansion factor of the velocity field domain beyond the image boundaries.
-    nt : int, default=3
-        Number of time steps for integrating the velocity field.
-    niter : int, default=5000
-        Total number of gradient descent iterations.
-    diffeo_start : int, default=0
-        Number of iterations optimizing only the affine part before starting nonlinear deformation updates.
-    epL : float, default=2e-8
-        Learning rate for the affine linear term.
-    epT : float, default=2e-1
-        Learning rate for the affine translation term.
-    epV : float, default=2e3
-        Learning rate for the velocity field.
-    sigmaM : float, default=1.0
-        Standard deviation for the **cell density** matching term.
-        Smaller values enforce tighter density alignment.
-    sigmaMg : float, default=1.0
-        Standard deviation for the **gene expression** matching term.
-        Smaller values emphasize stronger alignment of expression features.
-    sigmaB : float, default=2.0
-        Standard deviation for the background class in the Gaussian mixture model.
-        Used to handle missing tissue regions.
-    sigmaA : float, default=5.0
-        Standard deviation for the artifact class in the Gaussian mixture model.
-        Used to downweight unmatchable or noisy regions.
-    sigmaR : float, default=5e5
-        Regularization weight controlling smoothness of the velocity field.
-        Smaller values produce smoother, more regular deformations.
-    sigmaP : float, default=2e1
-        Standard deviation for landmark-based matching between `pointsI` and `pointsJ`.
-    device : str, default='cpu'
-        PyTorch device for computation (e.g., 'cpu' or 'cuda:0').
-    dtype : torch.dtype, default=torch.float64
-        Tensor precision used throughout optimization.
-    muA : torch.Tensor, optional
-        Mean intensity for the artifact class. If None, estimated automatically.
-    muB : torch.Tensor, optional
-        Mean intensity for the background class. If None, estimated automatically.
-
-    Returns
-    -------
-    dict
-        Dictionary containing:
-        - 'A': torch.Tensor  
-          Estimated affine transformation matrix.
-        - 'v' : torch.Tensor  
-          Optimized velocity field (nt × H × W × 2).
-        - 'xv' : list[torch.Tensor]  
-          Grid coordinates of the velocity field.
-        - 'WM', 'WB', 'WA' : torch.Tensor  
-          Gaussian mixture model weights (matching, background, artifact).
-        - 'AI' : torch.Tensor  
-          Source cell density image `I` warped into target space.
-        - 'AI_plt' : torch.Tensor  
-          Normalized, visualization-ready version of transformed `I`.
-        - 'J' : torch.Tensor  
-          Target cell density image.
-
-    Notes
-    -----
-    - This version of LDDMM jointly aligns **cell density** and **gene expression** data across tissue slices.
-    - The algorithm minimizes a multi-term energy functional combining image, expression, and landmark matching
-      with smoothness regularization.
-    - Regularization ensures biologically plausible, smooth, and invertible deformations suitable for
-      spatial transcriptomics registration.
-
-    """
- 
-    if A is not None:
-        # if we specify an A
-        if L is not None or T is not None:
-            raise Exception('If specifying A, you must not specify L or T')
-        L = torch.tensor(A[:2,:2],device=device,dtype=dtype,requires_grad=True)
-        T = torch.tensor(A[:2,-1],device=device,dtype=dtype,requires_grad=True)   
-    else:
-        # if we do not specify A                
-        if L is None: L = torch.eye(2,device=device,dtype=dtype,requires_grad=True)
-        if T is None: T = torch.zeros(2,device=device,dtype=dtype,requires_grad=True)
-    L = torch.tensor(L,device=device,dtype=dtype,requires_grad=True)
-    T = torch.tensor(T,device=device,dtype=dtype,requires_grad=True)
-    # change to torch
-    I = torch.tensor(I,device=device,dtype=dtype)                         
-    J = torch.tensor(J,device=device,dtype=dtype)
-    Jg = torch.tensor(Jg,device=device,dtype=dtype)
-    if v is not None and xv is not None:
-        v = torch.tensor(v,device=device,dtype=dtype,requires_grad=True)
-        xv = [torch.tensor(x,device=device,dtype=dtype) for x in xv]
-        XV = torch.stack(torch.meshgrid(xv),-1)
-        nt = v.shape[0]        
-    elif v is None and xv is None:
-        minv = torch.as_tensor([x[0] for x in xI],device=device,dtype=dtype)
-        maxv = torch.as_tensor([x[-1] for x in xI],device=device,dtype=dtype)
-        minv,maxv = (minv+maxv)*0.5 + 0.5*torch.tensor([-1.0,1.0],device=device,dtype=dtype)[...,None]*(maxv-minv)*expand # WHY DO IT THIS WAY??
-        xv = [torch.arange(m,M,a*0.5,device=device,dtype=dtype) for m,M in zip(minv,maxv)] # "a" determines step size of velocity field
-        XV = torch.stack(torch.meshgrid(xv),-1) #creating a meshgrid to apply transformation to all points in a grid (creating the 'field' in velocity field)
-        v = torch.zeros((nt,XV.shape[0],XV.shape[1],XV.shape[2]),device=device,dtype=dtype,requires_grad=True) # why does XW have a shape of 3 (aren't there only x and y points? 2D)
-        #velocity field start out as a zero vector field - how does it get updated? 
-    else:
-        raise Exception(f'If inputting an initial v, must input both xv and v')
-    extentV = extent_from_x(xv) #for plotting purposes
-    dv = torch.as_tensor([x[1]-x[0] for x in xv],device=device,dtype=dtype) #step in between each set of points
-    
-    
- 
-    fv = [torch.arange(n,device=device,dtype=dtype)/n/d for n,d in zip(XV.shape,dv)] # 5 dimensions of grid of XV/dv - should be similar to XV but not a meshgrid, just points along each axis
-    extentF = extent_from_x(fv) #plotting
-    FV = torch.stack(torch.meshgrid(fv),-1) # would this not just be the same as XV? print out both and compare 
-    LL = (1.0 + 2.0*a**2* torch.sum( (1.0 - torch.cos(2.0*np.pi*FV*dv))/dv**2 ,-1))**(p*2.0) #smoothing kernel? what is this?
-
-    K = 1.0/LL
-    #fig,ax = plt.subplots()
-    #ax.imshow(K,vmin=0.0,vmax=0.1,extent=extentF)
-    
-    #fig,ax = plt.subplots()
-    #ax.imshow(K[0].cpu())
-    DV = torch.prod(dv)
-    Ki = torch.fft.ifftn(K).real
-    fig,ax = plt.subplots()
-    ax.imshow(Ki.clone().detach().cpu().numpy(),vmin=0.0,extent=extentV)
-    ax.set_title('smoothing kernel')
-    fig.canvas.draw()
-
-
-    # nt = 3
-    
-
-
-    WM = torch.ones(J[0].shape,dtype=J.dtype,device=J.device)*0.5
-    WB = torch.ones(J[0].shape,dtype=J.dtype,device=J.device)*0.4
-    WA = torch.ones(J[0].shape,dtype=J.dtype,device=J.device)*0.1
-    if pointsI is None and pointsJ is None:
-        pointsI = torch.zeros((0,2),device=J.device,dtype=J.dtype)
-        pointsJ = torch.zeros((0,2),device=J.device,dtype=J.dtype) 
-    elif (pointsI is None and pointsJ is not None) or (pointsJ is None and pointsI is not None):
-        raise Exception('Must specify corresponding sets of points or none at all')
-    else:
-        pointsI = torch.tensor(pointsI,device=J.device,dtype=J.dtype)
-        pointsJ = torch.tensor(pointsJ,device=J.device,dtype=J.dtype)
-    
-    
-    xI = [torch.tensor(x,device=device,dtype=dtype) for x in xI]
-    xJ = [torch.tensor(x,device=device,dtype=dtype) for x in xJ]
-    XI = torch.stack(torch.meshgrid(*xI,indexing='ij'),-1)
-    XJ = torch.stack(torch.meshgrid(*xJ,indexing='ij'),-1)
-    dJ = [x[1]-x[0] for x in xJ]
-    extentJ = (xJ[1][0].item()-dJ[1].item()/2.0,
-          xJ[1][-1].item()+dJ[1].item()/2.0,
-          xJ[0][-1].item()+dJ[0].item()/2.0,
-          xJ[0][0].item()-dJ[0].item()/2.0)
-    
-
-    if muA is None:
-        estimate_muA = True
-    else:
-        estimate_muA = False
-    if muB is None:
-        estimate_muB = True
-    else:
-        estimate_muB = False
-    
-    fig,ax = plt.subplots(2,3)
-    ax = ax.ravel()
-    figE,axE = plt.subplots(1,5)
-    Esave = []
-
-    try:
-        L.grad.zero_()
-    except:
-        pass
-    try:
-        T.grad.zero_()
-    except:
-        pass
-
-
-    
-    for it in range(niter):
-        # make A
-        A = to_A(L,T)
-        # Ai
-        Ai = torch.linalg.inv(A)
-        # transform sample points
-        Xs = (Ai[:2,:2]@XJ[...,None])[...,0] + Ai[:2,-1]    
-        # now diffeo, not semilagrange here
-        for t in range(nt-1,-1,-1):
-            Xs = Xs + interp(xv,-v[t].permute(2,0,1),Xs.permute(2,0,1)).permute(1,2,0)/nt
-        # and points
-        pointsIt = torch.clone(pointsI)
-        if pointsIt.shape[0] >0:
-            for t in range(nt):            
-                pointsIt += interp(xv,v[t].permute(2,0,1),pointsIt.T[...,None])[...,0].T/nt
-            pointsIt = (A[:2,:2]@pointsIt.T + A[:2,-1][...,None]).T
-        #print(Xs.shape)
-        # transform image
-        #AI = interp(xI,I.swapaxes(1,2),Xs.permute(2,1,0),padding_mode="border")
-        AI = interp(xI,I,Xs.permute(2,0,1),padding_mode="border")
-        AIg = interp(xI,Ig,Xs.permute(2,0,1),padding_mode="border")
-        #AI = AI.permute(0,2,1)
-        #print(AI.shape)
-        #print(J.shape)
-        if it == 0:
-            AI_orig = AIg.clone().detach()
-        # objective function
-        EMg = torch.sum((AIg - Jg)**2*WM)/2.0/sigmaMg**2
-        
-        EM = torch.sum((AI - J)**2*WM)/2.0/sigmaM**2
-        ER = torch.sum(torch.sum(torch.abs(torch.fft.fftn(v,dim=(1,2)))**2,dim=(0,-1))*LL)*DV/2.0/v.shape[1]/v.shape[2]/sigmaR**2
-        E = EM + ER + EMg
-        tosave = [E.item(), EM.item(), ER.item(), EMg.item()]
-        if pointsIt.shape[0]>0:
-            EP = torch.sum((pointsIt - pointsJ)**2)/2.0/sigmaP**2
-            E += EP
-            tosave.append(EP.item())
-        
-        Esave.append( tosave )
-        # gradient update
-        E.backward()
-        with torch.no_grad():            
-            L -= (epL/(1.0 + (it>=diffeo_start)*9))*L.grad
-            T -= (epT/(1.0 + (it>=diffeo_start)*9))*T.grad
-
-            L.grad.zero_()
-            T.grad.zero_()
-            
-
-            # v grad
-            vgrad = v.grad
-            # smooth it
-            vgrad = torch.fft.ifftn(torch.fft.fftn(vgrad,dim=(1,2))*K[...,None],dim=(1,2)).real
-            if it >= diffeo_start:
-                v -= vgrad*epV
-            v.grad.zero_()
-
-
-        # update weights
-        if not it%5:
-            with torch.no_grad():
-                # M step for these params
-                if estimate_muA:
-                    muA = torch.sum(WA*J,dim=(-1,-2))/torch.sum(WA)
-                if estimate_muB:
-                    muB = torch.sum(WB*J,dim=(-1,-2))/torch.sum(WB)
-                #if it <= 200:
-                #    muA = torch.tensor([0.75,0.77,0.79],device=J.device,dtype=J.dtype)
-                #    muB = torch.ones(J.shape[0],device=J.device,dtype=J.dtype)*0.9
-
-
-
-
-        # draw
-        if not it%10:
-            AI_plt = AIg
-            J_plt = Jg
-            #print(AI.shape)
-            if AI.shape[0]>=1:
-                AI_plt = torch.mean(AIg, 0)
-                AI_plt = torch.unsqueeze(AI_plt, 0)
-                AI_orig = torch.mean(AI_orig, 0)
-                AI_orig = torch.unsqueeze(AI_orig, 0)
-                J_plt = torch.mean(Jg, 0)
-                J_plt = torch.unsqueeze(J_plt, 0)
-            #print(AI_plt.shape)
-            ax[0].cla()
-            ax[0].imshow(   ((AI_orig-torch.amin(AI_orig,(1,2))[...,None,None])/(torch.amax(AI_orig,(1,2))-torch.amin(AI_orig,(1,2)))[...,None,None]).permute(1,2,0).clone().detach().cpu(),extent=extentJ)
-            ax[0].scatter(pointsIt[:,1].clone().detach().cpu(),pointsIt[:,0].clone().detach().cpu())
-            ax[0].set_title('space tformed source')
-            
-            ax[1].cla()
-            ax[1].imshow(   ((AI_plt-torch.amin(AI_plt,(1,2))[...,None,None])/(torch.amax(AI_plt,(1,2))-torch.amin(AI_plt,(1,2)))[...,None,None]).permute(1,2,0).clone().detach().cpu(),extent=extentJ)
-            ax[1].scatter(pointsIt[:,1].clone().detach().cpu(),pointsIt[:,0].clone().detach().cpu())
-            ax[1].set_title('space tformed source')
-            
-            ax[4].cla()
-            ax[4].imshow(clip( (AI_plt - J_plt)/(torch.max(Jg).item())*3.0  ).permute(1,2,0).clone().detach().cpu()*0.5+0.5,extent=extentJ)
-            ax[4].scatter(pointsIt[:,1].clone().detach().cpu(),pointsIt[:,0].clone().detach().cpu())
-            ax[4].scatter(pointsJ[:,1].clone().detach().cpu(),pointsJ[:,0].clone().detach().cpu())
-            ax[4].set_title('Error')
-
-            ax[2].cla()
-            ax[2].imshow(J_plt.permute(1,2,0).cpu()/torch.max(Jg).item(),extent=extentJ)
-            ax[2].scatter(pointsJ[:,1].clone().detach().cpu(),pointsJ[:,0].clone().detach().cpu())
-            ax[2].set_title('Target')
-
-
-            toshow = v[0].clone().detach().cpu()
-            toshow /= torch.max(torch.abs(toshow))
-            toshow = toshow*0.5+0.5
-            toshow = torch.cat((toshow,torch.zeros_like(toshow[...,0][...,None])),-1)   
-            ax[3].cla()
-            ax[3].imshow(clip(toshow),extent=extentV)
-            ax[3].set_title('velocity')
-            
-            axE[0].cla()
-            axE[0].plot([e[0] for e in Esave])
-            axE[0].legend(['E'])
-            axE[0].set_yscale('log')
-            axE[1].cla()
-            axE[1].plot([e[1] for e in Esave])
-            axE[1].legend(['EM'])
-            axE[1].set_yscale('log')
-            axE[2].cla()
-            axE[2].plot([e[2] for e in Esave])
-            axE[2].legend(['ER'])
-            axE[2].set_yscale('log')
-            axE[3].cla()
-            axE[3].plot([e[3] for e in Esave])
-            axE[3].legend(['EMg'])
-            axE[3].set_yscale('log')
-            axE[4].cla()
-            axE[4].plot([e[4] for e in Esave])
-            axE[4].legend(['EP'])
-            axE[4].set_yscale('log')
-
-            fig.canvas.draw()
-            figE.canvas.draw()
-            
-    return {
-        'A': A.clone().detach(), 
-        'v': v.clone().detach(), 
-        'xv': xv, 
-        'WM': WM.clone().detach(),
-        'WB': WB.clone().detach(),
-        'WA': WA.clone().detach(),
-        "AI_plt": AI_plt.clone().detach(),
-        "AI": AI.clone().detach(),
-        "J": J.clone().detach()
-    }
-
-## COMMENTED OUT ORIGINAL LDDMM() FUNCTION ## 
-# def LDDMM(xI,I,xJ,J,Ig, Jg, pointsI=None,pointsJ=None,
+# def LDDMM(xI,I,xJ,J, Ig, Jg, pointsI=None,pointsJ=None,
 #           L=None,T=None,A=None,v=None,xv=None,
 #           a=500.0,p=2.0,expand=2.0,nt=3,
 #          niter=5000,diffeo_start=0, epL=2e-8, epT=2e-1, epV=2e3,
-#          sigmaM=1.0,sigmaB=2.0,sigmaA=5.0,sigmaR=5e5,sigmaP=2e1,
+#          sigmaM=1.0,sigmaMg=1.0, sigmaB=2.0,sigmaA=5.0,sigmaR=5e5,sigmaP=2e1,
 #           device='cpu',dtype=torch.float64, muB=None, muA=None):
-#     ''' Run LDDMM between a pair of images.
-    
-#     This jointly estimates an affine transform A, and a diffeomorphism phi.
-#     The map is off the form x -> A phi x
-    
-    
+#     """
+#     Run LDDMM betwen a pair of source (I, Ig) and target (J, Jg) spatial transcriptomics images. 
+
+#     The algorithm jointly estimates: 
+#         1. An affine transformation A = [L | T], and 
+#         2. A nonlinear diffeomorphic deformation φ (phi) parameterized by the velocity field ('v')
+#     by minimizing a variational energy functional that aligns both cell density and 
+#     gene expression distributions. 
+
+#     The final mapping is of the form: 
+#         x → A φ(x)
+
 #     Parameters
 #     ----------
-#     xI : list of torch tensor
-#         Location of voxels in source image I
-#     I : torch tensor
-#         source image I, with channels along first axis        
-#     xJ : list of torch tensor
-#         Location of voxels in target image J
-#     J : torch tensor
-#         Target image J, with channels along first axis
-#     L : torch tensor
-#         Initial guess for linear transform (2x2 torch tensor). Defaults to None (identity).
-#     T : torch tensor
-#         Initial guess for translation (2 element torch tensor). Defaults to None (identity)
-#     A : torch tensor
-#         Initial guess for affine matrix.  Either L and T can be specified, or A, but not both.
-#         Defaults to None (identity).
-#     v : torch tensor
-#         Initial guess for velocity field
-#     xv : torch tensor
-#         pixel locations for velocity field
-#     a : float
-#         Smoothness scale of velocity field (default 500.0)
-#     p : float
-#         Power of Laplacian in velocity regularization (default 2.0)
-#     expand : float
-#         Factor to expand size of velocity field around image boundaries (default 2.0)
-#     nt : int
-#         Number of timesteps for integrating velocity field (default 3). Ignored if you input v.
-#     pointsI : torch tensor
-#         N x 2 set of corresponding points for matching in source image. Default None (no points).
-#     pointsJ : torch tensor
-#         N x 2 set of corresponding points for matching in target image. Default None (no points).
-#     niter : int
-#         Number of iterations of gradient descent optimization
-#     diffeo_start : int
-#         Number of iterations of gradient descent optimization for affine only, before nonlinear deformation.
-#     epL : float
-#         Gradient descent step size for linear part of affine.
-#     epT : float
-#         Gradient descent step size of translation part of affine.
-#     epV : float
-#         Gradient descent step size for velocity field.
-#     sigmaM : float
-#         Standard deviation of image matching term for Gaussian mixture modeling in cost function. 
-#         This term generally controls matching accuracy with smaller corresponding to more accurate.
-#         As an common example (rule of thumb), you could chose this parameter to be the variance of the pixels
-#         in your target image.
-#     sigmaB : float
-#         Standard deviation of backtround term for Gaussian mixture modeling in cost function. 
-#         If there is missing tissue in target, we may label some pixels in target as background,
-#         and not enforce matching here.
-#     sigmaA : float
-#         Standard deviation of artifact term for Gaussian mixture modeling in cost function. 
-#         If there are artifacts in target or other lack of corresponding between template and target, 
-#         we may label some pixels in target as artifact, and not enforce matching here.
-#     sigmaR: float
-#         Standard deviation for regularization. Smaller sigmaR means a smoother resulting transformation. 
-#         Regularization is of the form: 0.5/sigmaR^2 int_0^1 int_X |Lv|^2 dx dt. 
-#     sigmaP: float
-#         Standard deviation for matching of points.  
-#         Cost is of the form 0.5/sigmaP^2 sum_i (source_point_i - target_point_i)^2
-#     device: str
-#         torch device. defaults to 'cpu'. Can also be 'cuda:0' for example.
-#     dtype: torch dtype
-#         torch data type. defaults to torch.float64
-#     muA: torch tensor whose dimension is the same as the target image
-#         Defaults to None, which means we estimate this. If you provide a value, we will not estimate it.
-#         If the target is a RGB image, this should be a tensor of size 3.
-#         If the target is a grayscale image, this should be a tensor of size 1.
-#     muB: torch tensor whose dimension is the same as the target image
-#         Defaults to None, which means we estimate this. If you provide a value, we will not estimate it.
-        
-#     Returns a dictionary
+#     xI : list[torch.Tensor]
+#         Coordinate axes (e.g., [x, y]) for the source image `I`, in physical units (e.g., microns).
+#     I : torch.Tensor
+#         Source **cell density** image (e.g., rasterized cell positions), with channels along the first axis.
+#     xJ : list[torch.Tensor]
+#         Coordinate axes for the target image `J`.
+#     J : torch.Tensor
+#         Target **cell density** image.
+#     Ig : torch.Tensor
+#         Source **gene expression** tensor aligned with `I`. Each channel may represent a different gene.
+#     Jg : torch.Tensor
+#         Target **gene expression** tensor aligned with `J`.
+#     pointsI : torch.Tensor, optional
+#         N×2 set of landmark points (e.g., cell centroids) in the source image. Default is None.
+#     pointsJ : torch.Tensor, optional
+#         N×2 set of corresponding landmark points in the target image. Default is None.
+#     L : torch.Tensor, optional
+#         Initial 2×2 matrix for the linear component of the affine transformation. Defaults to identity.
+#     T : torch.Tensor, optional
+#         Initial 2-vector for the translation component. Defaults to zeros.
+#     A : torch.Tensor, optional
+#         Initial full affine transformation matrix [L | T]. Provide either `A` or (`L`, `T`), not both.
+#     v : torch.Tensor, optional
+#         Initial velocity field (nt × H × W × 2). If None, initialized to zeros.
+#     xv : list[torch.Tensor], optional
+#         Coordinate grid corresponding to velocity field `v`. Must be provided if `v` is given.
+#     a : float, default=500.0
+#         Smoothness scale for the velocity field regularization.
+#     p : float, default=2.0
+#         Power of the Laplacian used in regularization.
+#     expand : float, default=2.0
+#         Expansion factor of the velocity field domain beyond the image boundaries.
+#     nt : int, default=3
+#         Number of time steps for integrating the velocity field.
+#     niter : int, default=5000
+#         Total number of gradient descent iterations.
+#     diffeo_start : int, default=0
+#         Number of iterations optimizing only the affine part before starting nonlinear deformation updates.
+#     epL : float, default=2e-8
+#         Learning rate for the affine linear term.
+#     epT : float, default=2e-1
+#         Learning rate for the affine translation term.
+#     epV : float, default=2e3
+#         Learning rate for the velocity field.
+#     sigmaM : float, default=1.0
+#         Standard deviation for the **cell density** matching term.
+#         Smaller values enforce tighter density alignment.
+#     sigmaMg : float, default=1.0
+#         Standard deviation for the **gene expression** matching term.
+#         Smaller values emphasize stronger alignment of expression features.
+#     sigmaB : float, default=2.0
+#         Standard deviation for the background class in the Gaussian mixture model.
+#         Used to handle missing tissue regions.
+#     sigmaA : float, default=5.0
+#         Standard deviation for the artifact class in the Gaussian mixture model.
+#         Used to downweight unmatchable or noisy regions.
+#     sigmaR : float, default=5e5
+#         Regularization weight controlling smoothness of the velocity field.
+#         Smaller values produce smoother, more regular deformations.
+#     sigmaP : float, default=2e1
+#         Standard deviation for landmark-based matching between `pointsI` and `pointsJ`.
+#     device : str, default='cpu'
+#         PyTorch device for computation (e.g., 'cpu' or 'cuda:0').
+#     dtype : torch.dtype, default=torch.float64
+#         Tensor precision used throughout optimization.
+#     muA : torch.Tensor, optional
+#         Mean intensity for the artifact class. If None, estimated automatically.
+#     muB : torch.Tensor, optional
+#         Mean intensity for the background class. If None, estimated automatically.
+
+#     Returns
 #     -------
-#     {
-#     'A': torch tensor
-#         Affine transform
-#     'v': torch tensor
-#         Velocity field
-#     'xv': list of torch tensor
-#         Pixel locations in v
-#     'WM': torch tensor
-#         Resulting weight 2D array (matching)
-#     'WB': torch tensor
-#         Resulting weight 2D array (background)
-#     'WA': torch tensor
-#         Resulting weight 2D array (artifact)
-#     }
-    
-#     '''
-    
-    
-    
-    
-#     # todo
-#     # implement local?
-#     # more iters
+#     dict
+#         Dictionary containing:
+#         - 'A': torch.Tensor  
+#           Estimated affine transformation matrix.
+#         - 'v' : torch.Tensor  
+#           Optimized velocity field (nt × H × W × 2).
+#         - 'xv' : list[torch.Tensor]  
+#           Grid coordinates of the velocity field.
+#         - 'WM', 'WB', 'WA' : torch.Tensor  
+#           Gaussian mixture model weights (matching, background, artifact).
+#         - 'AI' : torch.Tensor  
+#           Source cell density image `I` warped into target space.
+#         - 'AI_plt' : torch.Tensor  
+#           Normalized, visualization-ready version of transformed `I`.
+#         - 'J' : torch.Tensor  
+#           Target cell density image.
 
-#     #niter = 2000
-#     #diffeo_start = 100
-#     #epL = 5e-11
-#     #epT = 5e-4
-#     #epV = 5e1
-#     #niter = 5000
+#     Notes
+#     -----
+#     - This version of LDDMM jointly aligns **cell density** and **gene expression** data across tissue slices.
+#     - The algorithm minimizes a multi-term energy functional combining image, expression, and landmark matching
+#       with smoothness regularization.
+#     - Regularization ensures biologically plausible, smooth, and invertible deformations suitable for
+#       spatial transcriptomics registration.
 
-#     # check initial inputs
+#     """
+ 
 #     if A is not None:
 #         # if we specify an A
 #         if L is not None or T is not None:
@@ -1495,18 +1116,7 @@ def LDDMM(xI,I,xJ,J, Ig, Jg, pointsI=None,pointsJ=None,
 #     # change to torch
 #     I = torch.tensor(I,device=device,dtype=dtype)                         
 #     J = torch.tensor(J,device=device,dtype=dtype)
-    
-#     #L = torch.eye(2,device=device,dtype=dtype,requires_grad=True)
-#     ##L.data[0,0] = -1.0
-#     ##L.data[:2,:2] *= 0.2
-#     #T = torch.zeros(2,device=device,dtype=dtype,requires_grad=True)
-#     ##T.data[0] = +2000.0
-#     ##T.data[1] = -xI[1][-1]/2.0*1.1
-
-#     # velocity
-#     #a = 500.0
-#     #p = 3.0
-#     #expand = 2.0
+#     Jg = torch.tensor(Jg,device=device,dtype=dtype)
 #     if v is not None and xv is not None:
 #         v = torch.tensor(v,device=device,dtype=dtype,requires_grad=True)
 #         xv = [torch.tensor(x,device=device,dtype=dtype) for x in xv]
@@ -1515,21 +1125,22 @@ def LDDMM(xI,I,xJ,J, Ig, Jg, pointsI=None,pointsJ=None,
 #     elif v is None and xv is None:
 #         minv = torch.as_tensor([x[0] for x in xI],device=device,dtype=dtype)
 #         maxv = torch.as_tensor([x[-1] for x in xI],device=device,dtype=dtype)
-#         minv,maxv = (minv+maxv)*0.5 + 0.5*torch.tensor([-1.0,1.0],device=device,dtype=dtype)[...,None]*(maxv-minv)*expand
-#         xv = [torch.arange(m,M,a*0.5,device=device,dtype=dtype) for m,M in zip(minv,maxv)]
-#         XV = torch.stack(torch.meshgrid(xv),-1)
-#         v = torch.zeros((nt,XV.shape[0],XV.shape[1],XV.shape[2]),device=device,dtype=dtype,requires_grad=True)
+#         minv,maxv = (minv+maxv)*0.5 + 0.5*torch.tensor([-1.0,1.0],device=device,dtype=dtype)[...,None]*(maxv-minv)*expand # WHY DO IT THIS WAY??
+#         xv = [torch.arange(m,M,a*0.5,device=device,dtype=dtype) for m,M in zip(minv,maxv)] # "a" determines step size of velocity field
+#         XV = torch.stack(torch.meshgrid(xv),-1) #creating a meshgrid to apply transformation to all points in a grid (creating the 'field' in velocity field)
+#         v = torch.zeros((nt,XV.shape[0],XV.shape[1],XV.shape[2]),device=device,dtype=dtype,requires_grad=True) # why does XW have a shape of 3 (aren't there only x and y points? 2D)
+#         #velocity field start out as a zero vector field - how does it get updated? 
 #     else:
 #         raise Exception(f'If inputting an initial v, must input both xv and v')
-#     extentV = extent_from_x(xv)
-#     dv = torch.as_tensor([x[1]-x[0] for x in xv],device=device,dtype=dtype)
+#     extentV = extent_from_x(xv) #for plotting purposes
+#     dv = torch.as_tensor([x[1]-x[0] for x in xv],device=device,dtype=dtype) #step in between each set of points
     
     
  
-#     fv = [torch.arange(n,device=device,dtype=dtype)/n/d for n,d in zip(XV.shape,dv)]
-#     extentF = extent_from_x(fv)
-#     FV = torch.stack(torch.meshgrid(fv),-1)
-#     LL = (1.0 + 2.0*a**2* torch.sum( (1.0 - torch.cos(2.0*np.pi*FV*dv))/dv**2 ,-1))**(p*2.0)
+#     fv = [torch.arange(n,device=device,dtype=dtype)/n/d for n,d in zip(XV.shape,dv)] # 5 dimensions of grid of XV/dv - should be similar to XV but not a meshgrid, just points along each axis
+#     extentF = extent_from_x(fv) #plotting
+#     FV = torch.stack(torch.meshgrid(fv),-1) # would this not just be the same as XV? print out both and compare 
+#     LL = (1.0 + 2.0*a**2* torch.sum( (1.0 - torch.cos(2.0*np.pi*FV*dv))/dv**2 ,-1))**(p*2.0) #smoothing kernel? what is this?
 
 #     K = 1.0/LL
 #     #fig,ax = plt.subplots()
@@ -1572,12 +1183,7 @@ def LDDMM(xI,I,xJ,J, Ig, Jg, pointsI=None,pointsJ=None,
 #           xJ[0][-1].item()+dJ[0].item()/2.0,
 #           xJ[0][0].item()-dJ[0].item()/2.0)
     
-#     #sigmaM = 0.2
-#     #sigmaB = 0.19
-#     #sigmaA = 0.3
-#     #sigmaR = 5e5
-#     #sigmaP = 2e-1
-    
+
 #     if muA is None:
 #         estimate_muA = True
 #     else:
@@ -1589,7 +1195,7 @@ def LDDMM(xI,I,xJ,J, Ig, Jg, pointsI=None,pointsJ=None,
     
 #     fig,ax = plt.subplots(2,3)
 #     ax = ax.ravel()
-#     figE,axE = plt.subplots(1,3)
+#     figE,axE = plt.subplots(1,5)
 #     Esave = []
 
 #     try:
@@ -1600,6 +1206,9 @@ def LDDMM(xI,I,xJ,J, Ig, Jg, pointsI=None,pointsJ=None,
 #         T.grad.zero_()
 #     except:
 #         pass
+
+
+    
 #     for it in range(niter):
 #         # make A
 #         A = to_A(L,T)
@@ -1616,33 +1225,23 @@ def LDDMM(xI,I,xJ,J, Ig, Jg, pointsI=None,pointsJ=None,
 #             for t in range(nt):            
 #                 pointsIt += interp(xv,v[t].permute(2,0,1),pointsIt.T[...,None])[...,0].T/nt
 #             pointsIt = (A[:2,:2]@pointsIt.T + A[:2,-1][...,None]).T
-
+#         #print(Xs.shape)
 #         # transform image
+#         #AI = interp(xI,I.swapaxes(1,2),Xs.permute(2,1,0),padding_mode="border")
 #         AI = interp(xI,I,Xs.permute(2,0,1),padding_mode="border")
-
-#         # transform the contrast
-#         B = torch.ones(1+AI.shape[0],AI.shape[1]*AI.shape[2],device=AI.device,dtype=AI.dtype)
-#         B[1:AI.shape[0]+1] = AI.reshape(AI.shape[0],-1)
-#         #B = torch.ones(10,AI.shape[1]*AI.shape[2],device=AI.device,dtype=AI.dtype)
-#         #B[1:4] = AI.reshape(AI.shape[0],-1)
-#         #B[4] = (AI[0][None]**2).reshape(1,-1)
-#         #B[5] = (AI[1][None]**2).reshape(1,-1)
-#         #B[6] = (AI[2][None]**2).reshape(1,-1)
-#         #B[7] = (AI[0][None]*AI[1][None]).reshape(1,-1)
-#         #B[8] = (AI[0][None]*AI[2][None]).reshape(1,-1)
-#         #B[9] = (AI[1][None]*AI[2][None]).reshape(1,-1)
-#         with torch.no_grad():    
-#             BB = B@(B*WM.ravel()).T
-#             BJ = B@((J*WM).reshape(J.shape[0],J.shape[1]*J.shape[2])).T
-#             small = 0.1
-#             coeffs = torch.linalg.solve(BB + small*torch.eye(BB.shape[0],device=BB.device,dtype=BB.dtype),BJ)
-#         fAI = ((B.T@coeffs).T).reshape(J.shape)
-
+#         AIg = interp(xI,Ig,Xs.permute(2,0,1),padding_mode="border")
+#         #AI = AI.permute(0,2,1)
+#         #print(AI.shape)
+#         #print(J.shape)
+#         if it == 0:
+#             AI_orig = AIg.clone().detach()
 #         # objective function
-#         EM = torch.sum((fAI - J)**2*WM)/2.0/sigmaM**2
+#         EMg = torch.sum((AIg - Jg)**2*WM)/2.0/sigmaMg**2
+        
+#         EM = torch.sum((AI - J)**2*WM)/2.0/sigmaM**2
 #         ER = torch.sum(torch.sum(torch.abs(torch.fft.fftn(v,dim=(1,2)))**2,dim=(0,-1))*LL)*DV/2.0/v.shape[1]/v.shape[2]/sigmaR**2
-#         E = EM + ER
-#         tosave = [E.item(), EM.item(), ER.item()]
+#         E = EM + ER + EMg
+#         tosave = [E.item(), EM.item(), ER.item(), EMg.item()]
 #         if pointsIt.shape[0]>0:
 #             EP = torch.sum((pointsIt - pointsJ)**2)/2.0/sigmaP**2
 #             E += EP
@@ -1678,55 +1277,44 @@ def LDDMM(xI,I,xJ,J, Ig, Jg, pointsI=None,pointsJ=None,
 #                     muB = torch.sum(WB*J,dim=(-1,-2))/torch.sum(WB)
 #                 #if it <= 200:
 #                 #    muA = torch.tensor([0.75,0.77,0.79],device=J.device,dtype=J.dtype)
-#                 #    muB = torch.ones(J.shape[0],device=J.device,dtype=J.dtype)*0.96
-
-#                 if it >= 50:
-
-#                     W = torch.stack((WM,WA,WB))
-#                     pi = torch.sum(W,dim=(1,2))
-#                     pi += torch.max(pi)*1e-6
-#                     pi /= torch.sum(pi)
-
-
-#                     # now the E step, update the weights
-#                     WM = pi[0]* torch.exp( -torch.sum((fAI - J)**2,0)/2.0/sigmaM**2 )/np.sqrt(2.0*np.pi*sigmaM**2)**J.shape[0]
-#                     WA = pi[1]* torch.exp( -torch.sum((muA[...,None,None] - J)**2,0)/2.0/sigmaA**2 )/np.sqrt(2.0*np.pi*sigmaA**2)**J.shape[0]
-#                     WB = pi[2]* torch.exp( -torch.sum((muB[...,None,None] - J)**2,0)/2.0/sigmaB**2 )/np.sqrt(2.0*np.pi*sigmaB**2)**J.shape[0]
-#                     WS = WM+WB+WA
-#                     WS += torch.max(WS)*1e-6
-#                     WM /= WS
-#                     WB /= WS
-#                     WA /= WS
+#                 #    muB = torch.ones(J.shape[0],device=J.device,dtype=J.dtype)*0.9
 
 
 
 
 #         # draw
 #         if not it%10:
+#             AI_plt = AIg
+#             J_plt = Jg
+#             #print(AI.shape)
+#             if AI.shape[0]>=1:
+#                 AI_plt = torch.mean(AIg, 0)
+#                 AI_plt = torch.unsqueeze(AI_plt, 0)
+#                 AI_orig = torch.mean(AI_orig, 0)
+#                 AI_orig = torch.unsqueeze(AI_orig, 0)
+#                 J_plt = torch.mean(Jg, 0)
+#                 J_plt = torch.unsqueeze(J_plt, 0)
+#             #print(AI_plt.shape)
 #             ax[0].cla()
-#             ax[0].imshow(   ((AI-torch.amin(AI,(1,2))[...,None,None])/(torch.amax(AI,(1,2))-torch.amin(AI,(1,2)))[...,None,None]).permute(1,2,0).clone().detach().cpu(),extent=extentJ)
+#             ax[0].imshow(   ((AI_orig-torch.amin(AI_orig,(1,2))[...,None,None])/(torch.amax(AI_orig,(1,2))-torch.amin(AI_orig,(1,2)))[...,None,None]).permute(1,2,0).clone().detach().cpu(),extent=extentJ)
 #             ax[0].scatter(pointsIt[:,1].clone().detach().cpu(),pointsIt[:,0].clone().detach().cpu())
 #             ax[0].set_title('space tformed source')
             
-#             ax[1].cla()    
-#             ax[1].imshow(clip(fAI.permute(1,2,0).clone().detach()/torch.max(J).item()).cpu(),extent=extentJ)
+#             ax[1].cla()
+#             ax[1].imshow(   ((AI_plt-torch.amin(AI_plt,(1,2))[...,None,None])/(torch.amax(AI_plt,(1,2))-torch.amin(AI_plt,(1,2)))[...,None,None]).permute(1,2,0).clone().detach().cpu(),extent=extentJ)
 #             ax[1].scatter(pointsIt[:,1].clone().detach().cpu(),pointsIt[:,0].clone().detach().cpu())
-#             ax[1].set_title('contrast tformed source')
+#             ax[1].set_title('space tformed source')
             
-#             ax[5].cla()
-#             ax[5].imshow(clip( (fAI - J)/(torch.max(J).item())*3.0  ).permute(1,2,0).clone().detach().cpu()*0.5+0.5,extent=extentJ)
-#             ax[5].scatter(pointsIt[:,1].clone().detach().cpu(),pointsIt[:,0].clone().detach().cpu())
-#             ax[5].scatter(pointsJ[:,1].clone().detach().cpu(),pointsJ[:,0].clone().detach().cpu())
-#             ax[5].set_title('Error')
+#             ax[4].cla()
+#             ax[4].imshow(clip( (AI_plt - J_plt)/(torch.max(Jg).item())*3.0  ).permute(1,2,0).clone().detach().cpu()*0.5+0.5,extent=extentJ)
+#             ax[4].scatter(pointsIt[:,1].clone().detach().cpu(),pointsIt[:,0].clone().detach().cpu())
+#             ax[4].scatter(pointsJ[:,1].clone().detach().cpu(),pointsJ[:,0].clone().detach().cpu())
+#             ax[4].set_title('Error')
 
 #             ax[2].cla()
-#             ax[2].imshow(J.permute(1,2,0).cpu()/torch.max(J).item(),extent=extentJ)
+#             ax[2].imshow(J_plt.permute(1,2,0).cpu()/torch.max(Jg).item(),extent=extentJ)
 #             ax[2].scatter(pointsJ[:,1].clone().detach().cpu(),pointsJ[:,0].clone().detach().cpu())
 #             ax[2].set_title('Target')
-
-#             ax[4].cla()
-#             ax[4].imshow(clip(torch.stack((WM,WA,WB),-1).clone().detach()).cpu(),extent=extentJ)
-#             ax[4].set_title('Weights')
 
 
 #             toshow = v[0].clone().detach().cpu()
@@ -1738,19 +1326,25 @@ def LDDMM(xI,I,xJ,J, Ig, Jg, pointsI=None,pointsJ=None,
 #             ax[3].set_title('velocity')
             
 #             axE[0].cla()
-#             axE[0].plot(Esave)
-#             axE[0].legend(['E','EM','ER','EP'])
+#             axE[0].plot([e[0] for e in Esave])
+#             axE[0].legend(['E'])
 #             axE[0].set_yscale('log')
 #             axE[1].cla()
-#             axE[1].plot([e[:2] for e in Esave])
-#             axE[1].legend(['E','EM'])
+#             axE[1].plot([e[1] for e in Esave])
+#             axE[1].legend(['EM'])
 #             axE[1].set_yscale('log')
 #             axE[2].cla()
 #             axE[2].plot([e[2] for e in Esave])
 #             axE[2].legend(['ER'])
 #             axE[2].set_yscale('log')
-
-
+#             axE[3].cla()
+#             axE[3].plot([e[3] for e in Esave])
+#             axE[3].legend(['EMg'])
+#             axE[3].set_yscale('log')
+#             axE[4].cla()
+#             axE[4].plot([e[4] for e in Esave])
+#             axE[4].legend(['EP'])
+#             axE[4].set_yscale('log')
 
 #             fig.canvas.draw()
 #             figE.canvas.draw()
@@ -1761,8 +1355,415 @@ def LDDMM(xI,I,xJ,J, Ig, Jg, pointsI=None,pointsJ=None,
 #         'xv': xv, 
 #         'WM': WM.clone().detach(),
 #         'WB': WB.clone().detach(),
-#         'WA': WA.clone().detach()
+#         'WA': WA.clone().detach(),
+#         "AI_plt": AI_plt.clone().detach(),
+#         "AI": AI.clone().detach(),
+#         "J": J.clone().detach()
 #     }
+
+# COMMENTED OUT ORIGINAL LDDMM() FUNCTION ## 
+def LDDMM(xI,I,xJ,J,pointsI=None,pointsJ=None,
+          L=None,T=None,A=None,v=None,xv=None,
+          a=500.0,p=2.0,expand=2.0,nt=3,
+         niter=5000,diffeo_start=0, epL=2e-8, epT=2e-1, epV=2e3,
+         sigmaM=1.0,sigmaB=2.0,sigmaA=5.0,sigmaR=5e5,sigmaP=2e1,
+          device='cpu',dtype=torch.float64, muB=None, muA=None):
+    ''' Run LDDMM between a pair of images.
+    
+    This jointly estimates an affine transform A, and a diffeomorphism phi.
+    The map is off the form x -> A phi x
+    
+    
+    Parameters
+    ----------
+    xI : list of torch tensor
+        Location of voxels in source image I
+    I : torch tensor
+        source image I, with channels along first axis        
+    xJ : list of torch tensor
+        Location of voxels in target image J
+    J : torch tensor
+        Target image J, with channels along first axis
+    L : torch tensor
+        Initial guess for linear transform (2x2 torch tensor). Defaults to None (identity).
+    T : torch tensor
+        Initial guess for translation (2 element torch tensor). Defaults to None (identity)
+    A : torch tensor
+        Initial guess for affine matrix.  Either L and T can be specified, or A, but not both.
+        Defaults to None (identity).
+    v : torch tensor
+        Initial guess for velocity field
+    xv : torch tensor
+        pixel locations for velocity field
+    a : float
+        Smoothness scale of velocity field (default 500.0)
+    p : float
+        Power of Laplacian in velocity regularization (default 2.0)
+    expand : float
+        Factor to expand size of velocity field around image boundaries (default 2.0)
+    nt : int
+        Number of timesteps for integrating velocity field (default 3). Ignored if you input v.
+    pointsI : torch tensor
+        N x 2 set of corresponding points for matching in source image. Default None (no points).
+    pointsJ : torch tensor
+        N x 2 set of corresponding points for matching in target image. Default None (no points).
+    niter : int
+        Number of iterations of gradient descent optimization
+    diffeo_start : int
+        Number of iterations of gradient descent optimization for affine only, before nonlinear deformation.
+    epL : float
+        Gradient descent step size for linear part of affine.
+    epT : float
+        Gradient descent step size of translation part of affine.
+    epV : float
+        Gradient descent step size for velocity field.
+    sigmaM : float
+        Standard deviation of image matching term for Gaussian mixture modeling in cost function. 
+        This term generally controls matching accuracy with smaller corresponding to more accurate.
+        As an common example (rule of thumb), you could chose this parameter to be the variance of the pixels
+        in your target image.
+    sigmaB : float
+        Standard deviation of backtround term for Gaussian mixture modeling in cost function. 
+        If there is missing tissue in target, we may label some pixels in target as background,
+        and not enforce matching here.
+    sigmaA : float
+        Standard deviation of artifact term for Gaussian mixture modeling in cost function. 
+        If there are artifacts in target or other lack of corresponding between template and target, 
+        we may label some pixels in target as artifact, and not enforce matching here.
+    sigmaR: float
+        Standard deviation for regularization. Smaller sigmaR means a smoother resulting transformation. 
+        Regularization is of the form: 0.5/sigmaR^2 int_0^1 int_X |Lv|^2 dx dt. 
+    sigmaP: float
+        Standard deviation for matching of points.  
+        Cost is of the form 0.5/sigmaP^2 sum_i (source_point_i - target_point_i)^2
+    device: str
+        torch device. defaults to 'cpu'. Can also be 'cuda:0' for example.
+    dtype: torch dtype
+        torch data type. defaults to torch.float64
+    muA: torch tensor whose dimension is the same as the target image
+        Defaults to None, which means we estimate this. If you provide a value, we will not estimate it.
+        If the target is a RGB image, this should be a tensor of size 3.
+        If the target is a grayscale image, this should be a tensor of size 1.
+    muB: torch tensor whose dimension is the same as the target image
+        Defaults to None, which means we estimate this. If you provide a value, we will not estimate it.
+        
+    Returns a dictionary
+    -------
+    {
+    'A': torch tensor
+        Affine transform
+    'v': torch tensor
+        Velocity field
+    'xv': list of torch tensor
+        Pixel locations in v
+    'WM': torch tensor
+        Resulting weight 2D array (matching)
+    'WB': torch tensor
+        Resulting weight 2D array (background)
+    'WA': torch tensor
+        Resulting weight 2D array (artifact)
+    }
+    
+    '''
+    
+    
+    
+    
+    # todo
+    # implement local?
+    # more iters
+
+    #niter = 2000
+    #diffeo_start = 100
+    #epL = 5e-11
+    #epT = 5e-4
+    #epV = 5e1
+    #niter = 5000
+
+    # check initial inputs
+    if A is not None:
+        # if we specify an A
+        if L is not None or T is not None:
+            raise Exception('If specifying A, you must not specify L or T')
+        L = torch.tensor(A[:2,:2],device=device,dtype=dtype,requires_grad=True)
+        T = torch.tensor(A[:2,-1],device=device,dtype=dtype,requires_grad=True)   
+    else:
+        # if we do not specify A                
+        if L is None: L = torch.eye(2,device=device,dtype=dtype,requires_grad=True)
+        if T is None: T = torch.zeros(2,device=device,dtype=dtype,requires_grad=True)
+    L = torch.tensor(L,device=device,dtype=dtype,requires_grad=True)
+    T = torch.tensor(T,device=device,dtype=dtype,requires_grad=True)
+    # change to torch
+    I = torch.tensor(I,device=device,dtype=dtype)                         
+    J = torch.tensor(J,device=device,dtype=dtype)
+    
+    #L = torch.eye(2,device=device,dtype=dtype,requires_grad=True)
+    ##L.data[0,0] = -1.0
+    ##L.data[:2,:2] *= 0.2
+    #T = torch.zeros(2,device=device,dtype=dtype,requires_grad=True)
+    ##T.data[0] = +2000.0
+    ##T.data[1] = -xI[1][-1]/2.0*1.1
+
+    # velocity
+    #a = 500.0
+    #p = 3.0
+    #expand = 2.0
+    if v is not None and xv is not None:
+        v = torch.tensor(v,device=device,dtype=dtype,requires_grad=True)
+        xv = [torch.tensor(x,device=device,dtype=dtype) for x in xv]
+        XV = torch.stack(torch.meshgrid(xv),-1)
+        nt = v.shape[0]        
+    elif v is None and xv is None:
+        minv = torch.as_tensor([x[0] for x in xI],device=device,dtype=dtype)
+        maxv = torch.as_tensor([x[-1] for x in xI],device=device,dtype=dtype)
+        minv,maxv = (minv+maxv)*0.5 + 0.5*torch.tensor([-1.0,1.0],device=device,dtype=dtype)[...,None]*(maxv-minv)*expand
+        xv = [torch.arange(m,M,a*0.5,device=device,dtype=dtype) for m,M in zip(minv,maxv)]
+        XV = torch.stack(torch.meshgrid(xv),-1)
+        v = torch.zeros((nt,XV.shape[0],XV.shape[1],XV.shape[2]),device=device,dtype=dtype,requires_grad=True)
+    else:
+        raise Exception(f'If inputting an initial v, must input both xv and v')
+    extentV = extent_from_x(xv)
+    dv = torch.as_tensor([x[1]-x[0] for x in xv],device=device,dtype=dtype)
+    
+    
+ 
+    fv = [torch.arange(n,device=device,dtype=dtype)/n/d for n,d in zip(XV.shape,dv)]
+    extentF = extent_from_x(fv)
+    FV = torch.stack(torch.meshgrid(fv),-1)
+    LL = (1.0 + 2.0*a**2* torch.sum( (1.0 - torch.cos(2.0*np.pi*FV*dv))/dv**2 ,-1))**(p*2.0)
+
+    K = 1.0/LL
+    #fig,ax = plt.subplots()
+    #ax.imshow(K,vmin=0.0,vmax=0.1,extent=extentF)
+    
+    #fig,ax = plt.subplots()
+    #ax.imshow(K[0].cpu())
+    DV = torch.prod(dv)
+    Ki = torch.fft.ifftn(K).real
+    fig,ax = plt.subplots()
+    ax.imshow(Ki.clone().detach().cpu().numpy(),vmin=0.0,extent=extentV)
+    ax.set_title('smoothing kernel')
+    fig.canvas.draw()
+
+
+    # nt = 3
+    
+
+
+    WM = torch.ones(J[0].shape,dtype=J.dtype,device=J.device)*0.5
+    WB = torch.ones(J[0].shape,dtype=J.dtype,device=J.device)*0.4
+    WA = torch.ones(J[0].shape,dtype=J.dtype,device=J.device)*0.1
+    if pointsI is None and pointsJ is None:
+        pointsI = torch.zeros((0,2),device=J.device,dtype=J.dtype)
+        pointsJ = torch.zeros((0,2),device=J.device,dtype=J.dtype) 
+    elif (pointsI is None and pointsJ is not None) or (pointsJ is None and pointsI is not None):
+        raise Exception('Must specify corresponding sets of points or none at all')
+    else:
+        pointsI = torch.tensor(pointsI,device=J.device,dtype=J.dtype)
+        pointsJ = torch.tensor(pointsJ,device=J.device,dtype=J.dtype)
+    
+    
+    xI = [torch.tensor(x,device=device,dtype=dtype) for x in xI]
+    xJ = [torch.tensor(x,device=device,dtype=dtype) for x in xJ]
+    XI = torch.stack(torch.meshgrid(*xI,indexing='ij'),-1)
+    XJ = torch.stack(torch.meshgrid(*xJ,indexing='ij'),-1)
+    dJ = [x[1]-x[0] for x in xJ]
+    extentJ = (xJ[1][0].item()-dJ[1].item()/2.0,
+          xJ[1][-1].item()+dJ[1].item()/2.0,
+          xJ[0][-1].item()+dJ[0].item()/2.0,
+          xJ[0][0].item()-dJ[0].item()/2.0)
+    
+    #sigmaM = 0.2
+    #sigmaB = 0.19
+    #sigmaA = 0.3
+    #sigmaR = 5e5
+    #sigmaP = 2e-1
+    
+    if muA is None:
+        estimate_muA = True
+    else:
+        estimate_muA = False
+    if muB is None:
+        estimate_muB = True
+    else:
+        estimate_muB = False
+    
+    fig,ax = plt.subplots(2,3)
+    ax = ax.ravel()
+    figE,axE = plt.subplots(1,3)
+    Esave = []
+
+    try:
+        L.grad.zero_()
+    except:
+        pass
+    try:
+        T.grad.zero_()
+    except:
+        pass
+    for it in range(niter):
+        # make A
+        A = to_A(L,T)
+        # Ai
+        Ai = torch.linalg.inv(A)
+        # transform sample points
+        Xs = (Ai[:2,:2]@XJ[...,None])[...,0] + Ai[:2,-1]    
+        # now diffeo, not semilagrange here
+        for t in range(nt-1,-1,-1):
+            Xs = Xs + interp(xv,-v[t].permute(2,0,1),Xs.permute(2,0,1)).permute(1,2,0)/nt
+        # and points
+        pointsIt = torch.clone(pointsI)
+        if pointsIt.shape[0] >0:
+            for t in range(nt):            
+                pointsIt += interp(xv,v[t].permute(2,0,1),pointsIt.T[...,None])[...,0].T/nt
+            pointsIt = (A[:2,:2]@pointsIt.T + A[:2,-1][...,None]).T
+
+        # transform image
+        AI = interp(xI,I,Xs.permute(2,0,1),padding_mode="border")
+
+        # transform the contrast
+        B = torch.ones(1+AI.shape[0],AI.shape[1]*AI.shape[2],device=AI.device,dtype=AI.dtype)
+        B[1:AI.shape[0]+1] = AI.reshape(AI.shape[0],-1)
+        #B = torch.ones(10,AI.shape[1]*AI.shape[2],device=AI.device,dtype=AI.dtype)
+        #B[1:4] = AI.reshape(AI.shape[0],-1)
+        #B[4] = (AI[0][None]**2).reshape(1,-1)
+        #B[5] = (AI[1][None]**2).reshape(1,-1)
+        #B[6] = (AI[2][None]**2).reshape(1,-1)
+        #B[7] = (AI[0][None]*AI[1][None]).reshape(1,-1)
+        #B[8] = (AI[0][None]*AI[2][None]).reshape(1,-1)
+        #B[9] = (AI[1][None]*AI[2][None]).reshape(1,-1)
+        with torch.no_grad():    
+            BB = B@(B*WM.ravel()).T
+            BJ = B@((J*WM).reshape(J.shape[0],J.shape[1]*J.shape[2])).T
+            small = 0.1
+            coeffs = torch.linalg.solve(BB + small*torch.eye(BB.shape[0],device=BB.device,dtype=BB.dtype),BJ)
+        fAI = ((B.T@coeffs).T).reshape(J.shape)
+
+        # objective function
+        EM = torch.sum((fAI - J)**2*WM)/2.0/sigmaM**2
+        ER = torch.sum(torch.sum(torch.abs(torch.fft.fftn(v,dim=(1,2)))**2,dim=(0,-1))*LL)*DV/2.0/v.shape[1]/v.shape[2]/sigmaR**2
+        E = EM + ER
+        tosave = [E.item(), EM.item(), ER.item()]
+        if pointsIt.shape[0]>0:
+            EP = torch.sum((pointsIt - pointsJ)**2)/2.0/sigmaP**2
+            E += EP
+            tosave.append(EP.item())
+        
+        Esave.append( tosave )
+        # gradient update
+        E.backward()
+        with torch.no_grad():            
+            L -= (epL/(1.0 + (it>=diffeo_start)*9))*L.grad
+            T -= (epT/(1.0 + (it>=diffeo_start)*9))*T.grad
+
+            L.grad.zero_()
+            T.grad.zero_()
+            
+
+            # v grad
+            vgrad = v.grad
+            # smooth it
+            vgrad = torch.fft.ifftn(torch.fft.fftn(vgrad,dim=(1,2))*K[...,None],dim=(1,2)).real
+            if it >= diffeo_start:
+                v -= vgrad*epV
+            v.grad.zero_()
+
+
+        # update weights
+        if not it%5:
+            with torch.no_grad():
+                # M step for these params
+                if estimate_muA:
+                    muA = torch.sum(WA*J,dim=(-1,-2))/torch.sum(WA)
+                if estimate_muB:
+                    muB = torch.sum(WB*J,dim=(-1,-2))/torch.sum(WB)
+                #if it <= 200:
+                #    muA = torch.tensor([0.75,0.77,0.79],device=J.device,dtype=J.dtype)
+                #    muB = torch.ones(J.shape[0],device=J.device,dtype=J.dtype)*0.96
+
+                if it >= 50:
+
+                    W = torch.stack((WM,WA,WB))
+                    pi = torch.sum(W,dim=(1,2))
+                    pi += torch.max(pi)*1e-6
+                    pi /= torch.sum(pi)
+
+
+                    # now the E step, update the weights
+                    WM = pi[0]* torch.exp( -torch.sum((fAI - J)**2,0)/2.0/sigmaM**2 )/np.sqrt(2.0*np.pi*sigmaM**2)**J.shape[0]
+                    WA = pi[1]* torch.exp( -torch.sum((muA[...,None,None] - J)**2,0)/2.0/sigmaA**2 )/np.sqrt(2.0*np.pi*sigmaA**2)**J.shape[0]
+                    WB = pi[2]* torch.exp( -torch.sum((muB[...,None,None] - J)**2,0)/2.0/sigmaB**2 )/np.sqrt(2.0*np.pi*sigmaB**2)**J.shape[0]
+                    WS = WM+WB+WA
+                    WS += torch.max(WS)*1e-6
+                    WM /= WS
+                    WB /= WS
+                    WA /= WS
+
+
+
+
+        # draw
+        if not it%10:
+            ax[0].cla()
+            ax[0].imshow(   ((AI-torch.amin(AI,(1,2))[...,None,None])/(torch.amax(AI,(1,2))-torch.amin(AI,(1,2)))[...,None,None]).permute(1,2,0).clone().detach().cpu(),extent=extentJ)
+            ax[0].scatter(pointsIt[:,1].clone().detach().cpu(),pointsIt[:,0].clone().detach().cpu())
+            ax[0].set_title('space tformed source')
+            
+            ax[1].cla()    
+            ax[1].imshow(clip(fAI.permute(1,2,0).clone().detach()/torch.max(J).item()).cpu(),extent=extentJ)
+            ax[1].scatter(pointsIt[:,1].clone().detach().cpu(),pointsIt[:,0].clone().detach().cpu())
+            ax[1].set_title('contrast tformed source')
+            
+            ax[5].cla()
+            ax[5].imshow(clip( (fAI - J)/(torch.max(J).item())*3.0  ).permute(1,2,0).clone().detach().cpu()*0.5+0.5,extent=extentJ)
+            ax[5].scatter(pointsIt[:,1].clone().detach().cpu(),pointsIt[:,0].clone().detach().cpu())
+            ax[5].scatter(pointsJ[:,1].clone().detach().cpu(),pointsJ[:,0].clone().detach().cpu())
+            ax[5].set_title('Error')
+
+            ax[2].cla()
+            ax[2].imshow(J.permute(1,2,0).cpu()/torch.max(J).item(),extent=extentJ)
+            ax[2].scatter(pointsJ[:,1].clone().detach().cpu(),pointsJ[:,0].clone().detach().cpu())
+            ax[2].set_title('Target')
+
+            ax[4].cla()
+            ax[4].imshow(clip(torch.stack((WM,WA,WB),-1).clone().detach()).cpu(),extent=extentJ)
+            ax[4].set_title('Weights')
+
+
+            toshow = v[0].clone().detach().cpu()
+            toshow /= torch.max(torch.abs(toshow))
+            toshow = toshow*0.5+0.5
+            toshow = torch.cat((toshow,torch.zeros_like(toshow[...,0][...,None])),-1)   
+            ax[3].cla()
+            ax[3].imshow(clip(toshow),extent=extentV)
+            ax[3].set_title('velocity')
+            
+            axE[0].cla()
+            axE[0].plot(Esave)
+            axE[0].legend(['E','EM','ER','EP'])
+            axE[0].set_yscale('log')
+            axE[1].cla()
+            axE[1].plot([e[:2] for e in Esave])
+            axE[1].legend(['E','EM'])
+            axE[1].set_yscale('log')
+            axE[2].cla()
+            axE[2].plot([e[2] for e in Esave])
+            axE[2].legend(['ER'])
+            axE[2].set_yscale('log')
+
+
+
+            fig.canvas.draw()
+            figE.canvas.draw()
+            
+    return {
+        'A': A.clone().detach(), 
+        'v': v.clone().detach(), 
+        'xv': xv, 
+        'WM': WM.clone().detach(),
+        'WB': WB.clone().detach(),
+        'WA': WA.clone().detach()
+    }
 
 
 def LDDMM_3D_to_slice(xI,I,xJ,J,pointsI=None,pointsJ=None,
