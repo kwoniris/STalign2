@@ -512,8 +512,8 @@ def rasterizeGeneExp(x, y, G, dx=30.0, blur=1.0, expand=1.1):
         x coords of cells
     y : numpy array of length N
         y coords of cells
-    G : pd.Dataframe of shape N x n_genes 
-        gene expression matrix (cell x gene)
+    G : pd.Dataframe of shape N (cells) x M (genes)
+        2d cell by gene expression matrix 
     dx : float (default=30.0) 
         Pixel size to rasterize data (in same units as x and y)
     blur : float or list of floats (default=1.0)
@@ -521,7 +521,7 @@ def rasterizeGeneExp(x, y, G, dx=30.0, blur=1.0, expand=1.1):
         number of pixels.  Can be a single value or a list to perform multi-scale smoothing.
     expand : float (default=1.1)
         Factor to expand sampled area beyond cells.
-         
+
     Returns
     -------
     X : np.ndarray, shape (n_genes, nrows, ncols)
@@ -553,10 +553,11 @@ def rasterizeGeneExp(x, y, G, dx=30.0, blur=1.0, expand=1.1):
     '''
     nrows, ncols = 0, 0 # initialize rows and cols 
 
+    # iterate through all genes in matrix 
     for i in range(G.shape[1]): 
         if(i==0):
             nrows, ncols = YI.size, XI.size 
-            X = np.empty([G.shape[1], nrows, ncols])
+            X = np.empty([G.shape[1], nrows, ncols]) 
             Y = np.empty([G.shape[1], nrows*ncols])
 
         # loop through all the genes 
