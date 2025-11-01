@@ -1,0 +1,25 @@
+name: stalign-env
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10 # need < python 3.10 version for installation
+  - numpy=1.26.4
+  - matplotlib
+  - pandas
+  - pytorch
+  - torchvision
+  - torchaudio
+  - plotly
+  - requests
+  - jupyterlab
+  - ipywidgets
+
+# Create the environment: 
+## conda env create -f environment.yml
+## conda activate stalign-env
+# To install STalign: 
+## pip install --upgrade "git+https://github.com/JEFworks-Lab/STalign.git"
+## pip install "git+https://github.com/JEFworks-Lab/STalign.git"
