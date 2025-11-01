@@ -904,12 +904,124 @@ def L_T_from_points(pointsI,pointsJ):
     return L,T
 
 
-def LDDMM(xI,I,xJ,J,Ig, Jg, pointsI=None,pointsJ=None,
+def LDDMM(xI,I,xJ,J, Ig, Jg, pointsI=None,pointsJ=None,
           L=None,T=None,A=None,v=None,xv=None,
           a=500.0,p=2.0,expand=2.0,nt=3,
          niter=5000,diffeo_start=0, epL=2e-8, epT=2e-1, epV=2e3,
          sigmaM=1.0,sigmaMg=1.0, sigmaB=2.0,sigmaA=5.0,sigmaR=5e5,sigmaP=2e1,
           device='cpu',dtype=torch.float64, muB=None, muA=None):
+    """
+    Run LDDMM betwen a pair of source (I, Ig) and target (J, Jg) spatial transcriptomics images. 
+
+    The algorithm jointly estimates: 
+        1. An affine transformation A = [L | T], and 
+        2. A nonlinear diffeomorphic deformation φ (phi) parameterized by the velocity field ('v')
+    by minimizing a variational energy functional that aligns both cell density and 
+    gene expression distributions. 
+
+    The final mapping is of the form: 
+        x → A φ(x)
+
+    Parameters
+    ----------
+    xI : list[torch.Tensor]
+        Coordinate axes (e.g., [x, y]) for the source image `I`, in physical units (e.g., microns).
+    I : torch.Tensor
+        Source **cell density** image (e.g., rasterized cell positions), with channels along the first axis.
+    xJ : list[torch.Tensor]
+        Coordinate axes for the target image `J`.
+    J : torch.Tensor
+        Target **cell density** image.
+    Ig : torch.Tensor
+        Source **gene expression** tensor aligned with `I`. Each channel may represent a different gene.
+    Jg : torch.Tensor
+        Target **gene expression** tensor aligned with `J`.
+    pointsI : torch.Tensor, optional
+        N×2 set of landmark points (e.g., cell centroids) in the source image. Default is None.
+    pointsJ : torch.Tensor, optional
+        N×2 set of corresponding landmark points in the target image. Default is None.
+    L : torch.Tensor, optional
+        Initial 2×2 matrix for the linear component of the affine transformation. Defaults to identity.
+    T : torch.Tensor, optional
+        Initial 2-vector for the translation component. Defaults to zeros.
+    A : torch.Tensor, optional
+        Initial full affine transformation matrix [L | T]. Provide either `A` or (`L`, `T`), not both.
+    v : torch.Tensor, optional
+        Initial velocity field (nt × H × W × 2). If None, initialized to zeros.
+    xv : list[torch.Tensor], optional
+        Coordinate grid corresponding to velocity field `v`. Must be provided if `v` is given.
+    a : float, default=500.0
+        Smoothness scale for the velocity field regularization.
+    p : float, default=2.0
+        Power of the Laplacian used in regularization.
+    expand : float, default=2.0
+        Expansion factor of the velocity field domain beyond the image boundaries.
+    nt : int, default=3
+        Number of time steps for integrating the velocity field.
+    niter : int, default=5000
+        Total number of gradient descent iterations.
+    diffeo_start : int, default=0
+        Number of iterations optimizing only the affine part before starting nonlinear deformation updates.
+    epL : float, default=2e-8
+        Learning rate for the affine linear term.
+    epT : float, default=2e-1
+        Learning rate for the affine translation term.
+    epV : float, default=2e3
+        Learning rate for the velocity field.
+    sigmaM : float, default=1.0
+        Standard deviation for the **cell density** matching term.
+        Smaller values enforce tighter density alignment.
+    sigmaMg : float, default=1.0
+        Standard deviation for the **gene expression** matching term.
+        Smaller values emphasize stronger alignment of expression features.
+    sigmaB : float, default=2.0
+        Standard deviation for the background class in the Gaussian mixture model.
+        Used to handle missing tissue regions.
+    sigmaA : float, default=5.0
+        Standard deviation for the artifact class in the Gaussian mixture model.
+        Used to downweight unmatchable or noisy regions.
+    sigmaR : float, default=5e5
+        Regularization weight controlling smoothness of the velocity field.
+        Smaller values produce smoother, more regular deformations.
+    sigmaP : float, default=2e1
+        Standard deviation for landmark-based matching between `pointsI` and `pointsJ`.
+    device : str, default='cpu'
+        PyTorch device for computation (e.g., 'cpu' or 'cuda:0').
+    dtype : torch.dtype, default=torch.float64
+        Tensor precision used throughout optimization.
+    muA : torch.Tensor, optional
+        Mean intensity for the artifact class. If None, estimated automatically.
+    muB : torch.Tensor, optional
+        Mean intensity for the background class. If None, estimated automatically.
+
+    Returns
+    -------
+    dict
+        Dictionary containing:
+        - 'A': torch.Tensor  
+          Estimated affine transformation matrix.
+        - 'v' : torch.Tensor  
+          Optimized velocity field (nt × H × W × 2).
+        - 'xv' : list[torch.Tensor]  
+          Grid coordinates of the velocity field.
+        - 'WM', 'WB', 'WA' : torch.Tensor  
+          Gaussian mixture model weights (matching, background, artifact).
+        - 'AI' : torch.Tensor  
+          Source cell density image `I` warped into target space.
+        - 'AI_plt' : torch.Tensor  
+          Normalized, visualization-ready version of transformed `I`.
+        - 'J' : torch.Tensor  
+          Target cell density image.
+
+    Notes
+    -----
+    - This version of LDDMM jointly aligns **cell density** and **gene expression** data across tissue slices.
+    - The algorithm minimizes a multi-term energy functional combining image, expression, and landmark matching
+      with smoothness regularization.
+    - Regularization ensures biologically plausible, smooth, and invertible deformations suitable for
+      spatial transcriptomics registration.
+
+    """
  
     if A is not None:
         # if we specify an A
