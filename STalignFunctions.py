@@ -499,8 +499,83 @@ def rasterizePCA(x, y, G):
     
     return X, Y, W, V, Z, nrows, ncols
 
+### ADDED FUNCTION FOR RASTERIZE WITH CELL TYPE FOR GENE EXP ### 
+def rasterizeGeneExp(x, y, G, dx=30.0, blur=1.0, expand=1.1):
+    ''' 
+    Rasterize a spatial transcriptomics dataset into 2D gene expression images per gene.
 
+    Each gene's expression across spatial locs is converted into a smooth rasterized image. 
 
+    Parameters: 
+    ---------
+    x : numpy array of length N
+        x coords of cells
+    y : numpy array of length N
+        y coords of cells
+    G : pd.Dataframe of shape N x n_genes 
+        gene expression matrix (cell x gene)
+    dx : float (default=30.0) 
+        Pixel size to rasterize data (in same units as x and y)
+    blur : float or list of floats (default=1.0)
+        Standard deviation of Gaussian interpolation kernel.  Units are in 
+        number of pixels.  Can be a single value or a list to perform multi-scale smoothing.
+    expand : float (default=1.1)
+        Factor to expand sampled area beyond cells.
+         
+    Returns
+    -------
+    X : np.ndarray, shape (n_genes, nrows, ncols)
+        Rasterized gene expression images for each gene.
+    Y : np.ndarray, shape (n_genes, nrows*ncols)
+        Flattened and mean-centered version of each gene’s raster image.
+    XI : np.ndarray, shape (ncols,)
+        x coordinates of raster grid pixels.
+    YI : np.ndarray, shape (nrows,)
+        y coordinates of raster grid pixels.
+
+    Raises
+    ------
+    Exception
+        If `wavelet_magnitude=True` but `blur` is not sorted from largest to smallest.
+
+    Examples
+    --------
+    # Rasterize with default parameters (30 micron pixels, single kernel)
+    >>> X, Y, XI, YI = rasterizeGeneExp(x, y, G, dx=30.0, blur=1.0)
+
+    # Rasterize with multiple Gaussian kernels (multi-scale)
+    >>> X, Y, XI, YI = rasterizeGeneExp(x, y, G, dx=30.0, blur=[2.0,1.0,0.5])
+
+    # Rasterize with wavelet magnitude computation
+    >>> X, Y, XI, YI = rasterizeGeneExp(x, y, G, dx=30.0, blur=[2.0,1.0,0.5],
+                                        wavelet_magnitude=True)
+      
+    '''
+    nrows, ncols = 0, 0 # initialize rows and cols 
+
+    for i in range(G.shape[1]): 
+        if(i==0):
+            nrows, ncols = YI.size, XI.size 
+            X = np.empty([G.shape[1], nrows, ncols])
+            Y = np.empty([G.shape[1], nrows*ncols])
+
+        # loop through all the genes 
+        g = np.array(G.iloc[:,i]) # get gene exp vector for that gene 
+        # rasterize into smooth 2D image based on gene expression level at that spatial loc 
+        XI, YI, I = rasterize(X, y, g=g, dx=dx, blur=blur, expand=expand)
+
+        # center data 
+        X[i] = np.array(I)
+        I_ = I.ravel()
+        meanI = np.mean(I_)
+        I_ -= meanI 
+        Y[i] = I_
+
+        if(i % 50 == 0): 
+            print(f"{i} out of {G.shape[1]} genes rasterized.")
+    
+    return X, Y, XI, YI 
+    
 def make_scree(W, name, p=6):
     """Create a scree plot for a given set of eigenvalues.
     
@@ -903,7 +978,7 @@ def L_T_from_points(pointsI,pointsJ):
         T = A[:2,-1]
     return L,T
 
-
+### UPDATED LDDMM() FUNCTION WITH GENE EXP ### 
 def LDDMM(xI,I,xJ,J, Ig, Jg, pointsI=None,pointsJ=None,
           L=None,T=None,A=None,v=None,xv=None,
           a=500.0,p=2.0,expand=2.0,nt=3,
