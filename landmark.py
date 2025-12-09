@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt 
 import cv2
 
-def get_edge_landmarks(img, n_points=20, threshold=0.15):
+def get_edge_landmarks(Xg, n_points=20, threshold=0.15):
     """
     Extract n evenly-spaced points from the tissue edge.
 
@@ -20,6 +20,7 @@ def get_edge_landmarks(img, n_points=20, threshold=0.15):
     landmarks : np.ndarray
         Array of shape (n_points, 2) with (x, y) coordinates
     """
+    img = np.mean(Xg, axis=0)  # average across genes if you want
 
     # 1. Binary mask
     mask = img > threshold * img.max()
@@ -46,9 +47,19 @@ def get_edge_landmarks(img, n_points=20, threshold=0.15):
         idx = min(idx, len(contour)-1)
         sampled.append(contour[idx])
 
-    return np.array(sampled)
+    return np.array(sampled, dtype=np.float64)
 
 def visualize_points(XgI, XgJ, pointsI, pointsJ): 
+    """
+    Display source and target images with landmarks.
+
+    Parameters
+    ----------
+    XgI, XgJ : np.ndarray (a 3D tensor)
+        Rasterized images (n_genes, nrows, ncols)
+    pointsI, pointsJ : np.ndarray
+        Landmark coordinates in (row, col) format
+    """
     # Suppose your images are 2D arrays
     img_source = np.mean(XgI, axis=0)  # average across genes if you want
     img_target = np.mean(XgJ, axis=0)
