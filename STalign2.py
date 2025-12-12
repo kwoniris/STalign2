@@ -852,7 +852,7 @@ def plot_energy_lddmm(out, n_iter, a, sigmaMg=None, sigmaM=None):
     ax[2].set_title(f"ER")
 
 
-def plot_final_align(out, n_iter, a, sigmaMg=None, sigmaM=None, yI, xI, xJ, yJ):
+def plot_final_align(out,  yI, xI, xJ, yJ, n_iter, a, sigmaMg=None, sigmaM=None):
     A = out['A']
     v = out['v']
     xv = out['xv']
