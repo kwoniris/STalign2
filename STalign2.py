@@ -8,6 +8,7 @@ import pandas as pd
 import scanpy as sc
 import numpy as np
 import anndata as ad 
+import STalign
 
 def normalize(arr, t_min=0, t_max=1):
     """Linearly normalizes an array between two specifed values.
@@ -657,3 +658,222 @@ def LDDMM(xI,I,xJ,J,Ig, Jg, pointsI=None,pointsJ=None,
         "pointsIt": pointsIt.clone().detach(), # final aligned points 
         "E": Esave_array
     }
+
+def LDDMM_core(
+    xI, I, xJ, J, Ig, Jg, pointsI=None, pointsJ=None,
+    L=None, T=None, A=None, v=None, xv=None,
+    a=500.0, p=2.0, expand=2.0, nt=3,
+    niter=5000, diffeo_start=0, epL=2e-8, epT=2e-1, epV=2e3,
+    sigmaM=1.0, sigmaMg=1.0, sigmaB=2.0, sigmaA=5.0, sigmaR=5e5, sigmaP=2e1,
+    device='cpu', dtype=torch.float64, muB=None, muA=None
+):
+    import torch
+    import torch.nn.functional as F
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # --- Linear transform setup ---
+    if A is not None:
+        if L is not None or T is not None:
+            raise Exception('If specifying A, you must not specify L or T')
+        L = A[:2, :2].clone().to(device=device, dtype=dtype).requires_grad_(True)
+        T = A[:2, -1].clone().to(device=device, dtype=dtype).requires_grad_(True)
+    else:
+        if L is None:
+            L = torch.eye(2, device=device, dtype=dtype, requires_grad=True)
+        if T is None:
+            T = torch.zeros(2, device=device, dtype=dtype, requires_grad=True)
+
+    # --- Convert images to tensors ---
+    I = torch.tensor(I, device=device, dtype=dtype)
+    J = torch.tensor(J, device=device, dtype=dtype)
+    Jg = torch.tensor(Jg, device=device, dtype=dtype)
+
+    # --- Velocity field setup ---
+    if v is not None and xv is not None:
+        v = torch.tensor(v, device=device, dtype=dtype, requires_grad=True)
+        xv = [torch.tensor(x, device=device, dtype=dtype) for x in xv]
+        XV = torch.stack(torch.meshgrid(*xv, indexing='ij'), -1)
+        nt = v.shape[0]
+    elif v is None and xv is None:
+        minv = torch.as_tensor([x[0] for x in xI], device=device, dtype=dtype)
+        maxv = torch.as_tensor([x[-1] for x in xI], device=device, dtype=dtype)
+        # Expand domain
+        minv, maxv = (minv + maxv)/2 + 0.5*torch.tensor([-1.0, 1.0], device=device, dtype=dtype)[..., None]*(maxv - minv)*expand
+        xv = [torch.arange(m, M, a*0.5, device=device, dtype=dtype) for m, M in zip(minv, maxv)]
+        XV = torch.stack(torch.meshgrid(*xv, indexing='ij'), -1)
+        v = torch.zeros((nt, *XV.shape[:2]), device=device, dtype=dtype, requires_grad=True)
+    else:
+        raise Exception('Must provide both v and xv if initializing velocity')
+
+    # --- FFT smoothing kernel ---
+    dv = torch.as_tensor([x[1]-x[0] for x in xv], device=device, dtype=dtype)
+    fv = [torch.arange(n, device=device, dtype=dtype)/n/d for n, d in zip(XV.shape[:2], dv)]
+    FV = torch.stack(torch.meshgrid(*fv, indexing='ij'), -1)
+    LL = (1.0 + 2.0*a**2*torch.sum((1.0 - torch.cos(2*np.pi*FV*dv))/dv**2, -1))**(p*2.0)
+    K = 1.0 / LL
+    DV = torch.prod(dv)
+
+    # --- Initialize masks & points ---
+    WM = torch.ones(J[0].shape, device=J.device, dtype=J.dtype)*0.5
+    WB = torch.ones(J[0].shape, device=J.device, dtype=J.dtype)*0.4
+    WA = torch.ones(J[0].shape, device=J.device, dtype=J.dtype)*0.1
+
+    if pointsI is None and pointsJ is None:
+        pointsI = torch.zeros((0,2), device=J.device, dtype=J.dtype)
+        pointsJ = torch.zeros((0,2), device=J.device, dtype=J.dtype)
+    elif (pointsI is None) != (pointsJ is None):
+        raise Exception('Must specify corresponding sets of points or none at all')
+    else:
+        pointsI = torch.tensor(pointsI, device=J.device, dtype=J.dtype)
+        pointsJ = torch.tensor(pointsJ, device=J.device, dtype=J.dtype)
+
+    xI = [torch.tensor(x, device=device, dtype=dtype) for x in xI]
+    xJ = [torch.tensor(x, device=device, dtype=dtype) for x in xJ]
+    XI = torch.stack(torch.meshgrid(*xI, indexing='ij'), -1)
+    XJ = torch.stack(torch.meshgrid(*xJ, indexing='ij'), -1)
+    dJ = [x[1]-x[0] for x in xJ]
+
+    # --- Estimate muA / muB ---
+    estimate_muA = muA is None
+    estimate_muB = muB is None
+
+    Esave = []
+
+    for it in range(niter):
+        # Linear transform
+        A = to_A(L, T)
+        Ai = torch.linalg.inv(A)
+        Xs = (Ai[:2, :2] @ XJ[..., None])[..., 0] + Ai[:2, -1]
+
+        # Diffeomorphism update
+        for t in range(nt-1, -1, -1):
+            # print("v[t].shape:", v[t].shape)
+            # print("Xs.shape:", Xs.shape)
+            #Xs = Xs + interp(xv, -v[t].permute(2,0,1), Xs.permute(2,0,1)).permute(1,2,0)/nt
+            Xs_input = Xs.permute(2,0,1) # [2,H,W] for interp
+            v_input = -v[t][None,:,:] # add channel dim [1,H,W] for interp 
+            Xs = Xs + interp(xv, v_input, Xs_input).permute(1,2,0)/nt
+
+        # Points
+        pointsIt = pointsI.clone()
+        if pointsIt.shape[0] > 0:
+            for t in range(nt):
+                #pointsIt += interp(xv, v[t].permute(2,0,1), pointsIt.T[..., None])[..., 0].T/nt
+                v_input = v[t][None, :, :]                  # [1,H,W]
+                pointsIt += interp(xv, v_input, pointsIt.T[...,None])[...,0].T / nt
+            pointsIt = (A[:2,:2]@pointsIt.T + A[:2,-1][..., None]).T
+
+        # Image interpolation
+        AI = interp(xI, I, Xs.permute(2,0,1), padding_mode="border")
+        AIg = interp(xI, Ig, Xs.permute(2,0,1), padding_mode="border")
+
+        # --- Resize reference images and masks to match AI / AIg ---
+        H_ai, W_ai = AI.shape[:2]      # only spatial dimensions
+        C_ai = AI.shape[2] if AI.ndim==3 else 1
+
+        # Resize J to match AI spatially
+        if J.ndim == 2:
+            J_resized = F.interpolate(J[None, None], size=(H_ai, W_ai), mode='bilinear', align_corners=False).squeeze(0).squeeze(0)
+        elif J.ndim == 3 and J.shape[2] == C_ai:
+            # already matches channel dimension
+            J_resized = J
+        else:
+            # If channels differ, expand dims
+            J_resized = F.interpolate(J.permute(2,0,1)[None], size=(H_ai, W_ai), mode='bilinear', align_corners=False)
+            J_resized = J_resized.squeeze(0).permute(1,2,0)
+
+        # Resize Jg and mask WM
+        if Jg.ndim == 2:
+            Jg_resized = F.interpolate(Jg[None,None], size=(H_ai, W_ai), mode='bilinear', align_corners=False).squeeze(0).squeeze(0)
+        elif Jg.ndim == 3 and Jg.shape[2] == AIg.shape[2]:
+            Jg_resized = Jg
+        else:
+            Jg_resized = F.interpolate(Jg.permute(2,0,1)[None], size=(H_ai, W_ai), mode='bilinear', align_corners=False)
+            Jg_resized = Jg_resized.squeeze(0).permute(1,2,0)
+
+        WM_resized = F.interpolate(WM[None,None], size=(H_ai, W_ai), mode='nearest').squeeze(0).squeeze(0)
+
+        # --- Objective function ---
+        EM  = torch.sum((AI - J_resized)**2 * WM_resized)/(2.0*sigmaM**2)
+        EMg = torch.sum((AIg - Jg_resized)**2 * WM_resized)/(2.0*sigmaMg**2)
+        ER = torch.sum(torch.sum(torch.abs(torch.fft.fftn(v, dim=(1,2)))**2, dim=(0,-1))*LL)*DV/2.0/v.shape[1]/v.shape[2]/sigmaR**2
+
+        E = EM + ER + EMg
+
+        if pointsIt.shape[0] > 0:
+            EP = torch.sum((pointsIt - pointsJ)**2)/(2.0*sigmaP**2)
+            E += EP
+
+        Esave.append([E.item(), EM.item(), ER.item(), EMg.item()] + ([EP.item()] if pointsIt.shape[0]>0 else []))
+
+        # Gradient step
+        E.backward()
+        with torch.no_grad():
+            L -= (epL / (1.0 + (it>=diffeo_start)*9)) * L.grad
+            T -= (epT / (1.0 + (it>=diffeo_start)*9)) * T.grad
+            L.grad.zero_()
+            T.grad.zero_()
+
+            # Smooth velocity gradient
+            vgrad = torch.fft.ifftn(torch.fft.fftn(v.grad, dim=(1,2)) * K[..., None], dim=(1,2)).real
+            if it >= diffeo_start:
+                v -= epV * vgrad
+            v.grad.zero_()
+
+            # Update mus
+            if not it % 5:
+                if estimate_muA:
+                    muA = torch.sum(WA*J, dim=(-1,-2))/torch.sum(WA)
+                if estimate_muB:
+                    muB = torch.sum(WB*J, dim=(-1,-2))/torch.sum(WB)
+
+    return {
+        'A': A.clone().detach(),
+        'v': v.clone().detach(),
+        'xv': xv,
+        'AI': AI.clone().detach(),
+        'pointsIt': pointsIt.clone().detach(),
+        'E': np.array(Esave)
+    }
+
+def plot_energy_lddmm(out, n_iter, a, sigmaMg=None, sigmaM=None): 
+    Esave = out['E']
+    # Esave saves total, EMg, and ER 
+    n_iter = 200 
+    fig, ax = plt.subplots(1,3, figsize=(18,5))
+    ax[0].plot(Esave[:,0]) 
+    ax[0].set_title(f"Total E with n_iter={n_iter}, a={a}, sigmaM={sigmaM}, sigmaMg={sigmaMg}")
+    ax[1].plot(Esave[:,1]) 
+    ax[1].set_title(f"EM")
+    ax[2].plot(Esave[:,3]) 
+    ax[2].set_title(f"EMg")
+    ax[2].plot(Esave[:,2]) 
+    ax[2].set_title(f"ER")
+
+
+def plot_final_align(out, n_iter, a, sigmaMg=None, sigmaM=None, yI, xI, xJ, yJ):
+    A = out['A']
+    v = out['v']
+    xv = out['xv']
+
+    # apply transform to original points
+    tpointsI= STalign.transform_points_source_to_target(xv,v,A, np.stack([yI, xI], axis=1))
+
+    #switch tensor from cuda to cpu for plotting with numpy
+    if tpointsI.is_cuda:
+        tpointsI = tpointsI.cpu()
+
+    #switch from row column coordinates (y,x) to (x,y)
+    xI_LDDMM = tpointsI[:,1]
+    yI_LDDMM = tpointsI[:,0]
+
+    # plot results
+    fig,ax = plt.subplots(figsize=(7,7))
+    ax.scatter(xI,yI,s=1,alpha=0.1, label='source')
+    ax.scatter(xI_LDDMM,yI_LDDMM,s=1,alpha=0.1, label = 'source aligned')
+    ax.scatter(xJ,yJ,s=1,alpha=0.1, label='target')
+    ax.legend(markerscale = 10)
+    ax.set_title("Aligned Source after STalign2")
+
+    
